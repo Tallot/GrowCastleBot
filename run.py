@@ -7,8 +7,10 @@ import cv2
 import keyboard
 import win32api, win32con, win32gui
 from PIL import ImageGrab
+import numpy as np
 
 from pprint import pprint
+from skimage.metrics import structural_similarity as ssim
 
 # Constants
 first_cell_ratio = (0.234, 0.132)
@@ -25,7 +27,7 @@ castle_ratio = {'lightning_castle': (0.803, 0.435), 'minigun': (0.803, 0.214), '
 castle_menu_close_ratio = (0.954, 0.105)
 castle_level_up_ratio = (0.702, 0.66)
 castle_close_level_up_ratio = (0.777, 0.222)
-crystals_max_ratio = (0.23, 0.03)
+crystals_rect_ratio = (0.225, 0.004, 0.257, 0.051)
 
 left_border_shift = 2
 upper_border_shift = 42
@@ -35,14 +37,14 @@ right_border_sidebar_shift = -62
 
 cooldown_rgb = (84, 188, 255) # (83, 186, 252)
 battle_button_rgb = (191, 185, 172)
-crystals_max_rgb = (251, 251, 251)
+crystals_max = np.load('60_crystals.npy')
 
 # User configs
 sidebar_used = False
 active_hero_cells = [1, 3, 5, 6, 9, 10, 11]
 donate_cell = True
 use_altar = False
-invest_crystals = 10
+invest_crystals = 20
 invest_towers = {0: 'lightning_castle', 1: 'minigun', 2: 'ballista'}
 interval_between_clicks = 0.4
 # feature: spell_usages = [True, True, True, True, False, False, False, False] # activate skill only once at the begging or by cd
@@ -86,7 +88,9 @@ def prepare_positions(coords):
 
     battle_button_pos = round(battle_button_ratio[0] * width) + coords[0], round(battle_button_ratio[1] * height) + coords[1]
     wave_skip_close_pos = round(wave_skip_close_ratio[0] * width) + coords[0], round(wave_skip_close_ratio[1] * height) + coords[1]
-    crystals_max = round(crystals_max_ratio[0] * width) + coords[0], round(crystals_max_ratio[1] * height) + coords[1]
+
+    crystals_rect = round(crystals_rect_ratio[0] * width), round(crystals_rect_ratio[1] * height), \
+                    round(crystals_rect_ratio[2] * width), round(crystals_rect_ratio[3] * height)
 
     towers = []
     for key, val in invest_towers.items():
@@ -103,12 +107,13 @@ def prepare_positions(coords):
     castle_level_up = round(castle_level_up_ratio[0] * width) + coords[0], round(castle_level_up_ratio[1] * height) + coords[1]
     castle_close_level_up = round(castle_close_level_up_ratio[0] * width) + coords[0], round(castle_close_level_up_ratio[1] * height) + coords[1]
 
-    return heroes, battle_button_pos, wave_skip_close_pos, crystals_max, towers, castle_button_pos, castle_menu_close, castle_level_up, castle_close_level_up
+    return heroes, battle_button_pos, wave_skip_close_pos, crystals_rect, towers, castle_button_pos, castle_menu_close, castle_level_up, castle_close_level_up
 
 def check_cd_bar_pos(coords, heroes):
     # approxamation errors can exceed correct boundary of cooldown bar
     # grab image once and test, if out of boundary (wrong rgb) then try a few shifts (down and up) and update location
-    screen = ImageGrab.grab(bbox=coords).load()
+    screen = ImageGrab.grab(bbox=coords)
+    screen = np.transpose(np.array(screen), axes=(1, 0, 2))
     for hero in heroes:
         for px in (0, 1, -1, 2, -2, 3, -3, 4, -4):
             if screen[hero[1][0] - coords[0], hero[1][1] - coords[1] + px][0] == cooldown_rgb[0]:
@@ -117,6 +122,12 @@ def check_cd_bar_pos(coords, heroes):
             if px == -4:
                 raise RuntimeError('Could not locate cooldown bar for hero:', hero)
 
+def mse(a, b):
+	# NOTE: the two images must have the same dimension
+	error = np.sum((a.astype(np.float32) - b.astype(np.float32)) ** 2)
+	error /= (a.shape[0] * b.shape[1])
+
+	return error
 
 def click(x, y):
     win32api.SetCursorPos((x, y))
@@ -128,12 +139,18 @@ def click_n_wait(x, y, interval=0.4):
     click(x, y)
     time.sleep(interval)
 
-def run_bot(coords, heroes, battle_button_pos, wave_skip_close_pos, crystals_max, towers, castle_button_pos,
+def run_bot(coords, heroes, battle_button_pos, wave_skip_close_pos, crystals_rect, towers, castle_button_pos,
             castle_menu_close, castle_level_up, castle_close_level_up):
-    screen = ImageGrab.grab(bbox=coords).load()
+    screen = ImageGrab.grab(bbox=coords)
+    screen = np.transpose(np.array(screen), axes=(1, 0, 2))
     if screen[battle_button_pos[0] - coords[0], battle_button_pos[1] - coords[1]][0] == battle_button_rgb[0]:
-        if screen[crystals_max[0] - coords[0], crystals_max[1] - coords[1]][0] == crystals_max_rgb[0]:
+        crystals = screen[crystals_rect[0]:crystals_rect[2], crystals_rect[1]:crystals_rect[3], :]
+        crystals = cv2.cvtColor(crystals, cv2.COLOR_BGR2GRAY)
+        crystals = cv2.resize(crystals, crystals_max.shape[::-1], interpolation = cv2.INTER_AREA)
+
+        if ssim(crystals, crystals_max) > 0.7:
             print('Crystals at max!')
+            print(ssim(crystals, crystals_max))
             tower = random.choice(towers)
             click_n_wait(*castle_button_pos)
             click_n_wait(*(tower[0]))
@@ -156,10 +173,10 @@ if __name__ == '__main__':
         right_border_shift = right_border_sidebar_shift
     coords = get_game_field_coords(hwnd, left_border_shift, upper_border_shift, lower_border_shift, right_border_shift)
 
-    heroes, battle_button_pos, wave_skip_close_pos, crystals_max, towers, castle_button_pos, \
+    heroes, battle_button_pos, wave_skip_close_pos, crystals_rect, towers, castle_button_pos, \
         castle_menu_close, castle_level_up, castle_close_level_up = prepare_positions(coords)
     check_cd_bar_pos(coords, heroes)
 
     while keyboard.is_pressed('w') == False:
-        run_bot(coords, heroes, battle_button_pos, wave_skip_close_pos, crystals_max, towers, castle_button_pos,
+        run_bot(coords, heroes, battle_button_pos, wave_skip_close_pos, crystals_rect, towers, castle_button_pos,
             castle_menu_close, castle_level_up, castle_close_level_up)
