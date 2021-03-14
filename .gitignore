@@ -1,1 +1,3 @@
 parse_images/*
+.vscode/*
+__pycache__/*

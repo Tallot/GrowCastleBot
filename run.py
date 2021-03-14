@@ -1,182 +1,228 @@
 # coding: utf-8
 
-import time
 import random
 
 import cv2
 import keyboard
-import win32api, win32con, win32gui
-from PIL import ImageGrab
 import numpy as np
-
-from pprint import pprint
+import win32gui
+import win32ui
 from skimage.metrics import structural_similarity as ssim
 
-# Constants
-first_cell_ratio = (0.234, 0.132)
-first_cell_cd_ratio = (0.229, 0.071)
-between_cells_ratio = (0.062, 0.13)
-donate_cell_ratio = (0.168, 0.265)
-donate_cell_cd_ratio = (0.166, 0.205)
-altar_cell_ratio = (0.096, 0,308)
+from constants import Indicators, Ratios
+from utils import (get_game_screen_hwnd, grab_screen, send_click,
+                   send_click_n_wait)
 
-battle_button_ratio = (0.931, 0.922)
-wave_skip_close_ratio = (0.695, 0.323)
-
-castle_ratio = {'lightning_castle': (0.803, 0.435), 'minigun': (0.803, 0.214), 'ballista': (0.803, 0.576)}
-castle_menu_close_ratio = (0.954, 0.105)
-castle_level_up_ratio = (0.702, 0.66)
-castle_close_level_up_ratio = (0.777, 0.222)
-crystals_rect_ratio = (0.225, 0.004, 0.257, 0.051)
-
-left_border_shift = 2
-upper_border_shift = 42
-lower_border_shift = -2
-right_border_shift = -2
-right_border_sidebar_shift = -62
-
-cooldown_rgb = (84, 188, 255) # (83, 186, 252)
-battle_button_rgb = (191, 185, 172)
-crystals_max = np.load('60_crystals.npy')
+FPS = 30
 
 # User configs
-sidebar_used = False
-active_hero_cells = [1, 3, 5, 6, 9, 10, 11]
+active_hero_cells = [1, 3, 5, 6, 7, 8, 9, 10, 11]
 donate_cell = True
 use_altar = False
 invest_crystals = 20
-invest_towers = {0: 'lightning_castle', 1: 'minigun', 2: 'ballista'}
+invest_castles = {0: 'lightning_castle', 1: 'minigun', 2: 'ballista'}
 interval_between_clicks = 0.4
-# feature: spell_usages = [True, True, True, True, False, False, False, False] # activate skill only once at the begging or by cd
 
-def get_window_handle(window_title='BlueStacks'):
-    hwnd = win32gui.FindWindow(None, window_title)
-    return hwnd
 
-def get_game_field_coords(hwnd, left_border_shift, upper_border_shift, lower_border_shift, right_border_shift):
-    x0, y0, x1, y1 = win32gui.GetWindowRect(hwnd)
-    x0 += left_border_shift
-    y0 += upper_border_shift
-    x1 += right_border_shift
-    y1 += lower_border_shift
-    return (x0, y0, x1, y1)
+def abs_pos(x_rel, y_rel, width, height):
+    return round(x_rel * width), round(y_rel * height)
 
-def change_screen(hwnd, x_pos, y_pos, width, height):
-    # x_pos, y_pos - upper left corner
-    # width, height - desired window size
 
-    # win32gui.SetForegroundWindow(hwnd)
-    win32gui.MoveWindow(hwnd, x_pos, y_pos, x_pos + width, y_pos + height, True)
+def get_obj_positions(hero_cells, donate_cell, castle_cells, width, height):
+    heroes = []
+    for cell in hero_cells:
+        cell_offset = np.array([cell % 3, cell // 3])  # Column and row
 
-def prepare_positions(coords):
+        rel_click_pos = Ratios.FIRST_CELL_CENTER + cell_offset * Ratios.DST_BTWN_CELLS_CENTERS
+        click_pos = abs_pos(*rel_click_pos, width, height)
+
+        rel_cd_bar_pos = Ratios.FIRST_CELL_CD_BAR + cell_offset * Ratios.DST_BTWN_CELLS_CENTERS
+        cd_bar_pos = abs_pos(*rel_cd_bar_pos, width, height)
+
+        heroes.append((*click_pos, *cd_bar_pos))
+
+    if donate_cell:
+        click_pos = abs_pos(*Ratios.DONATE_CELL_CENTER, width, height)
+        cd_bar_pos = abs_pos(*Ratios.DONATE_CELL_CD_BAR, width, height)
+        heroes.append((*click_pos, *cd_bar_pos))
+
+    altar = abs_pos(*Ratios.ALTAR_CELL_CENTER, width, height)
+
+    castles = []
+    for key, val in castle_cells.items():
+        tower_offset = np.array([1, 1 + key])
+
+        rel_click_pos = Ratios.FIRST_CELL_CENTER + tower_offset * Ratios.DST_BTWN_CELLS_CENTERS
+        click_pos = abs_pos(*rel_click_pos, width, height)
+
+        menu_click_pos = abs_pos(*Ratios.CASTLE_MENU_BUTTONS[val], width, height)
+
+        castles.append((*click_pos, *menu_click_pos))
+
+    castle_level_up_button = abs_pos(*Ratios.CASTLE_LEVEL_UP_BUTTON, width, height)
+    castle_level_up_menu_close_button = abs_pos(*Ratios.CASTLE_LEVEL_UP_MENU_CLOSE_BUTTON, width, height)
+    castle_menu_button = abs_pos(*(Ratios.FIRST_CELL_CENTER + Ratios.DST_BTWN_CELLS_CENTERS * np.array([1, 4])),
+                                 width, height)
+    castle_menu_close_button = abs_pos(*Ratios.CASTLE_MENU_CLOSE_BUTTON, width, height)
+
+    battle_button = abs_pos(*Ratios.BATTLE_BUTTON, width, height)
+    wave_skip_close_button = abs_pos(*Ratios.WAVE_SKIP_CLOSE_BUTTON, width, height)
+    crystals_amount_bbox = abs_pos(*Ratios.CRYSTALS_AMOUNT_BBOX[:2], width, height) \
+        + abs_pos(*Ratios.CRYSTALS_AMOUNT_BBOX[2:], width, height)
+
+    game_objects = {
+        'heroes': heroes,
+        'altar': altar,
+        'castles': castles,
+        'castle_level_up_button': castle_level_up_button,
+        'castle_level_up_menu_close_button': castle_level_up_menu_close_button,
+        'castle_menu_button': castle_menu_button,
+        'castle_menu_close_button': castle_menu_close_button,
+        'battle_button': battle_button,
+        'wave_skip_close_button': wave_skip_close_button,
+        'crystals_amount_bbox': crystals_amount_bbox
+    }
+
+    return game_objects
+
+
+def get_puzzle_obj_positions(width, height):
+    circle_center = np.array(abs_pos(*Ratios.CIRCLE_CENTER, width, height))
+
+    # Counter clockwise
+    angles = [
+        0., np.pi/4, np.pi/2, 3*np.pi/4,
+        np.pi, 5*np.pi/4, 3*np.pi/2, 7*np.pi/4
+    ]
+    bbox_axes_distances = [Ratios.BBOX_CIRCLE_CENTERS_DST *
+                           np.array([np.cos(alpha), np.sin(alpha)]) for alpha in angles]
+    bbox_centers = [circle_center +
+                    abs_pos(*dist, width, width) for dist in bbox_axes_distances]
+    bbox_size = round(Ratios.BBOX_SIZE * width)
+    bboxes = [(bbox_center[0]-bbox_size, bbox_center[1]-bbox_size,
+               2*bbox_size, 2*bbox_size) for bbox_center in bbox_centers]
+
+    crystal_axes_distances = [Ratios.CRYSTAL_CIRCLE_CENTERS_DST *
+                              np.array([np.cos(alpha), np.sin(alpha)]) for alpha in angles]
+    crystal_centers = [circle_center +
+                       abs_pos(*dist, width, width) for dist in crystal_axes_distances]
+
+    puzzle_start_button = abs_pos(*Ratios.PUZZLE_START_BUTTON, width, height)
+
+    return {'bboxes': bboxes, 'crystal_centers': crystal_centers, 'puzzle_start_button': puzzle_start_button}
+
+
+def check_cd_bar_pos(screen, heroes):
+    # Approxamation errors can exceed correct boundary of cooldown bar
+    # Grab image once and test, if out of boundary (wrong rgb)
+    # then try a few shifts (down and up) and update location
+    for hero in heroes:
+        for px in (0, 1, -1, 2, -2, 3, -3, 4, -4):
+            if screen[hero[3], hero[2] + px][2] == Indicators.COOLDOWN_BAR_RGB[0]:
+                hero[3] += px
+                break
+            if px == -4:
+                raise RuntimeError('Could not locate cooldown bar for hero:',
+                                   hero)
+
+
+def run_bot(hwnd, game_objects, puzzle_objects, invest_crystals=5):
+    hwnd_dc = win32gui.GetWindowDC(hwnd)
+    mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+    save_dc = mfc_dc.CreateCompatibleDC()
+
+    save_bitmap = win32ui.CreateBitmap()
+    save_bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
+    save_dc.SelectObject(save_bitmap)
+
+    # check_cd_pos(game_objects['heroes'])
+
+    # last_time = time.time()
+    while 'Screen capturing':
+        # delta =  time.time() - last_time
+        # if delta > 1./FPS:
+        #     last_time = time.time()
+        #     print('fps: {0}'.format(delta))
+        #     continue worklfow here
+
+        # Grab game screen
+        screen = grab_screen(hwnd, save_dc, save_bitmap)
+
+        # Check if ready to battle
+        if screen[game_objects['battle_button'][1], game_objects['battle_button'][0]][2] == Indicators.BATTLE_BUTTON_RGB[0]:
+            # Check crystals condition
+            crystals = screen[game_objects['crystals_amount_bbox'][1]:game_objects['crystals_amount_bbox'][3],
+                              game_objects['crystals_amount_bbox'][0]:game_objects['crystals_amount_bbox'][2]]
+            crystals = cv2.cvtColor(crystals, cv2.COLOR_BGR2GRAY)
+            crystals = cv2.resize(crystals, Indicators.CRYSTALS_MAX_AMOUNT.shape[::-1],
+                                  interpolation=cv2.INTER_AREA)
+
+            if ssim(crystals, Indicators.CRYSTALS_MAX_AMOUNT) > 0.87:
+                # if screen[crystals_max[0] - coords[0], crystals_max[1] - coords[1]][0] == crystals_max_rgb[0]:
+                print('Crystals at max!')
+                castle = random.choice(game_objects['castles'])
+                send_click_n_wait(hwnd, *game_objects['castle_menu_button'])
+                send_click_n_wait(hwnd, castle[0], castle[1])
+                send_click_n_wait(hwnd, castle[2], castle[3])
+                for _ in range(invest_crystals):
+                    send_click_n_wait(
+                        hwnd, *game_objects['castle_level_up_button'], 0.3)
+                send_click_n_wait(
+                    hwnd, *game_objects['castle_level_up_menu_close_button'])
+                send_click_n_wait(
+                    hwnd, *game_objects['castle_menu_close_button'])
+
+            # Start battle
+            send_click_n_wait(hwnd, *game_objects['battle_button'])
+
+            # Check if puzzle appeard
+            screen = grab_screen(hwnd, save_dc, save_bitmap)
+            if screen[puzzle_objects['puzzle_start_button'][1], puzzle_objects['puzzle_start_button'][0]][2] == Indicators.PUZZLE_START_BUTTON_RGB[0]:
+                # Find crystal
+                pos = 0
+                for n, crystal_center in enumerate(puzzle_objects['crystal_centers']):
+                    if screen[crystal_center[1], crystal_center[0]][0] == Indicators.CRYSTAL_BLUE_CHANNEL:
+                        pos = n
+                        break
+                bbox = puzzle_objects['bboxes'][pos]
+
+                # Initialize tracker
+                tracker = cv2.TrackerMOSSE_create()
+                tracker.init(screen, bbox)
+
+                send_click(hwnd, *puzzle_objects['puzzle_start_button'])
+                for _ in range(150):
+                    screen = grab_screen(hwnd, save_dc, save_bitmap)
+                    _, detected_bbox = tracker.update(screen)
+
+                choice_click_pos = int(
+                    detected_bbox[0] + detected_bbox[2]//2), int(detected_bbox[1] + detected_bbox[3]//2)
+                cv2.imwrite('test_bbox.png', cv2.rectangle(screen, (int(detected_bbox[0]), int(detected_bbox[1])), (int(
+                    detected_bbox[0]+detected_bbox[2]), int(detected_bbox[1]+detected_bbox[3])), (255, 0, 0), 2))
+                send_click_n_wait(hwnd, *choice_click_pos)
+
+            send_click_n_wait(hwnd, *game_objects['wave_skip_close_button'])
+
+        for hero in game_objects['heroes']:
+            if screen[hero[3], hero[2]][2] == Indicators.COOLDOWN_BAR_RGB[0]:
+                send_click_n_wait(hwnd, hero[0], hero[1], 0.1)
+
+        # Press "w" to exit
+        if keyboard.is_pressed('w'):
+            win32gui.DeleteObject(save_bitmap.GetHandle())
+            save_dc.DeleteDC()
+            mfc_dc.DeleteDC()
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
+            break
+
+
+if __name__ == '__main__':
+    hwnd = get_game_screen_hwnd()
+    coords = win32gui.GetWindowRect(hwnd)
     width = coords[2] - coords[0]
     height = coords[3] - coords[1]
 
-    heroes = []
-    for cell in active_hero_cells:
-        cell_pos = cell % 3, cell // 3 # Column and row
-        click_pos = round((first_cell_ratio[0] + cell_pos[0] * between_cells_ratio[0]) * width) + coords[0], \
-            round((first_cell_ratio[1] + cell_pos[1] * between_cells_ratio[1]) * height) + coords[1]
-        cd_bar_loc = [round((first_cell_cd_ratio[0] + cell_pos[0] * between_cells_ratio[0]) * width) + coords[0],
-            round((first_cell_cd_ratio[1] + cell_pos[1] * between_cells_ratio[1]) * height) + coords[1]]
-        heroes.append((click_pos, cd_bar_loc))
-
-    if donate_cell:
-        donate_click_pos = round(donate_cell_ratio[0] * width) + coords[0], round(donate_cell_ratio[1] * height) + coords[1]
-        donate_cd_bar_loc = [round(donate_cell_cd_ratio[0] * width) + coords[0], round(donate_cell_cd_ratio[1] * height) + coords[1]]
-        heroes.append((donate_click_pos, donate_cd_bar_loc))
-
-    battle_button_pos = round(battle_button_ratio[0] * width) + coords[0], round(battle_button_ratio[1] * height) + coords[1]
-    wave_skip_close_pos = round(wave_skip_close_ratio[0] * width) + coords[0], round(wave_skip_close_ratio[1] * height) + coords[1]
-
-    crystals_rect = round(crystals_rect_ratio[0] * width), round(crystals_rect_ratio[1] * height), \
-                    round(crystals_rect_ratio[2] * width), round(crystals_rect_ratio[3] * height)
-
-    towers = []
-    for key, val in invest_towers.items():
-        tower_pos = 1, key + 1
-        click_pos = round((first_cell_ratio[0] + tower_pos[0] * between_cells_ratio[0]) * width) + coords[0], \
-            round((first_cell_ratio[1] + tower_pos[1] * between_cells_ratio[1]) * height) + coords[1]
-        menu_click_pos = round(castle_ratio[val][0] * width) + coords[0], round(castle_ratio[val][1] * height) + coords[1]
-        towers.append((click_pos, menu_click_pos))
-
-    castle_button_pos = round((first_cell_ratio[0] + between_cells_ratio[0]) * width) + coords[0], round((first_cell_ratio[1] + 4 * between_cells_ratio[1]) * height) + coords[1]
-
-    castle_menu_close = round(castle_menu_close_ratio[0] * width) + coords[0], round(castle_menu_close_ratio[1] * height) + coords[1]
-
-    castle_level_up = round(castle_level_up_ratio[0] * width) + coords[0], round(castle_level_up_ratio[1] * height) + coords[1]
-    castle_close_level_up = round(castle_close_level_up_ratio[0] * width) + coords[0], round(castle_close_level_up_ratio[1] * height) + coords[1]
-
-    return heroes, battle_button_pos, wave_skip_close_pos, crystals_rect, towers, castle_button_pos, castle_menu_close, castle_level_up, castle_close_level_up
-
-def check_cd_bar_pos(coords, heroes):
-    # approxamation errors can exceed correct boundary of cooldown bar
-    # grab image once and test, if out of boundary (wrong rgb) then try a few shifts (down and up) and update location
-    screen = ImageGrab.grab(bbox=coords)
-    screen = np.transpose(np.array(screen), axes=(1, 0, 2))
-    for hero in heroes:
-        for px in (0, 1, -1, 2, -2, 3, -3, 4, -4):
-            if screen[hero[1][0] - coords[0], hero[1][1] - coords[1] + px][0] == cooldown_rgb[0]:
-                hero[1][1] += px
-                break
-            if px == -4:
-                raise RuntimeError('Could not locate cooldown bar for hero:', hero)
-
-def mse(a, b):
-	# NOTE: the two images must have the same dimension
-	error = np.sum((a.astype(np.float32) - b.astype(np.float32)) ** 2)
-	error /= (a.shape[0] * b.shape[1])
-
-	return error
-
-def click(x, y):
-    win32api.SetCursorPos((x, y))
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
-    time.sleep(0.01)
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
-
-def click_n_wait(x, y, interval=0.4):
-    click(x, y)
-    time.sleep(interval)
-
-def run_bot(coords, heroes, battle_button_pos, wave_skip_close_pos, crystals_rect, towers, castle_button_pos,
-            castle_menu_close, castle_level_up, castle_close_level_up):
-    screen = ImageGrab.grab(bbox=coords)
-    screen = np.transpose(np.array(screen), axes=(1, 0, 2))
-    if screen[battle_button_pos[0] - coords[0], battle_button_pos[1] - coords[1]][0] == battle_button_rgb[0]:
-        crystals = screen[crystals_rect[0]:crystals_rect[2], crystals_rect[1]:crystals_rect[3], :]
-        crystals = cv2.cvtColor(crystals, cv2.COLOR_BGR2GRAY)
-        crystals = cv2.resize(crystals, crystals_max.shape[::-1], interpolation = cv2.INTER_AREA)
-
-        if ssim(crystals, crystals_max) > 0.7:
-            print('Crystals at max!')
-            print(ssim(crystals, crystals_max))
-            tower = random.choice(towers)
-            click_n_wait(*castle_button_pos)
-            click_n_wait(*(tower[0]))
-            click_n_wait(*(tower[1]))
-            for _ in range(invest_crystals):
-                click_n_wait(*castle_level_up)
-            click_n_wait(*castle_close_level_up)
-            click_n_wait(*castle_menu_close)
-        click_n_wait(*battle_button_pos)
-        click_n_wait(*wave_skip_close_pos)
-
-    for hero in heroes:
-        if screen[hero[1][0] - coords[0], hero[1][1] - coords[1]][0] == cooldown_rgb[0]:
-            click(*(hero[0]))
-            time.sleep(0.05)
-
-if __name__ == '__main__':
-    hwnd = get_window_handle()
-    if sidebar_used:
-        right_border_shift = right_border_sidebar_shift
-    coords = get_game_field_coords(hwnd, left_border_shift, upper_border_shift, lower_border_shift, right_border_shift)
-
-    heroes, battle_button_pos, wave_skip_close_pos, crystals_rect, towers, castle_button_pos, \
-        castle_menu_close, castle_level_up, castle_close_level_up = prepare_positions(coords)
-    check_cd_bar_pos(coords, heroes)
-
-    while keyboard.is_pressed('w') == False:
-        run_bot(coords, heroes, battle_button_pos, wave_skip_close_pos, crystals_rect, towers, castle_button_pos,
-            castle_menu_close, castle_level_up, castle_close_level_up)
+    obj_dict = get_obj_positions(active_hero_cells, donate_cell,
+                                 invest_castles, width, height)
+    puzzle_obj_dict = get_puzzle_obj_positions(width, height)
+    run_bot(hwnd, obj_dict, puzzle_obj_dict, invest_crystals)
